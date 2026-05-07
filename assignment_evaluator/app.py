@@ -207,14 +207,39 @@ def ask_for_api_key() -> str:
     return result["key"]
 
 
-MODEL_NAME = "gemini-2.0-flash"
+MODEL_NAME = "gemini-2.5-flash-lite"  # Free tier default with unlimited daily requests
 AVAILABLE_MODELS = [
-    "gemini-2.5-pro",
+    "gemini-3.1-flash-lite",  # Free tier
+    "gemini-3-flash",         # Free tier
+    "gemini-2.5-flash-lite",  # Free tier (unlimited daily requests)
+    "gemini-2.0-flash-lite",  # Free tier alternative
+    "gemma-3-27b-it",         # Text-only
+    "gemma-3-12b-it",         # Text-only
+    "gemma-3-4b-it",          # Text-only
+    "gemma-3-1b-it",          # Text-only
     "gemini-2.5-flash",
     "gemini-2.0-flash",
+    "gemini-3.1-pro",
+    "gemini-2.5-pro",
     "gemini-1.5-pro",
-    "gemini-2.0-flash-lite",
 ]
+
+# Map shorthand model names to full names for convenience
+MODEL_SHORTHAND_MAP = {
+    "gemini-lite": "gemini-3.1-flash-lite",
+    "gemini-flash": "gemini-3-flash",
+    "gemini-pro": "gemini-2.5-pro",
+    "gemma": "gemma-3-27b-it",
+}
+
+def normalize_model_name(model_name):
+    """Convert shorthand model names to full names. Returns the full name or the input if not a shorthand."""
+    return MODEL_SHORTHAND_MAP.get(model_name.lower(), model_name)
+
+
+def is_text_only_model(model_name):
+    normalized = normalize_model_name((model_name or "").strip()).lower()
+    return normalized.startswith("gemma-")
 
 
 # -----------------------------
@@ -242,6 +267,10 @@ DEFAULT_DPI = 150
 DEFAULT_TIMEOUT_SECONDS = 180
 DEFAULT_DELAY_SECONDS = 2
 DEFAULT_RETRY_COUNT = 3
+METADATA_PAGE_LIMIT = 8
+METADATA_DPI = 120
+METADATA_TIMEOUT_SECONDS = 45
+METADATA_RETRY_COUNT = 1
 DEFAULT_STRICTNESS = "moderate"
 DEFAULT_FEEDBACK_STYLE = "balanced"
 DEFAULT_EXPECT_HANDWRITTEN = True
@@ -506,17 +535,36 @@ def parse_question_marks_map(raw_map, fallback_default_marks):
     return parsed
 
 
-def extract_pdf_text(pdf_path, page_limit=DEFAULT_PAGE_LIMIT):
-    pages = []
+def extract_pdf_text(pdf_path, page_limit=DEFAULT_PAGE_LIMIT, logger=None, require_text=False):
+    if logger:
+        logger.info("Extracting text from PDF: %s", pdf_path)
+
     document = fitz.open(str(pdf_path))
+    pages = []
     try:
-        for page_index, page in enumerate(document, start=1):
-            if page_index > page_limit:
-                break
-            pages.append(page.get_text("text"))
+        max_pages = min(len(document), max(1, int(page_limit)))
+        for page_index in range(max_pages):
+            page = document.load_page(page_index)
+            text = page.get_text("text") or ""
+            pages.append(f"--- Page {page_index + 1} ---\n{text.strip()}")
     finally:
         document.close()
-    return "\n".join(pages)
+
+    combined = "\n\n".join(chunk for chunk in pages if chunk.strip())
+    if not combined.strip():
+        if require_text:
+            raise RuntimeError(
+                "No extractable text found in PDF. For scanned or handwritten PDFs, use a Gemini Flash model instead of Gemma."
+            )
+        return ""
+
+    max_chars = 120000
+    if len(combined) > max_chars:
+        if logger:
+            logger.info("Truncating extracted text from %s to %s characters for model input.", len(combined), max_chars)
+        combined = combined[:max_chars]
+
+    return combined
 
 
 def detect_questions_and_marks(text):
@@ -568,7 +616,7 @@ def detect_questions_and_marks(text):
 
 
 def auto_detect_assignment_metadata(assignment_pdf, fallback_question_count, fallback_default_marks):
-    extracted_text = extract_pdf_text(assignment_pdf, page_limit=DEFAULT_PAGE_LIMIT)
+    extracted_text = extract_pdf_text(assignment_pdf, page_limit=METADATA_PAGE_LIMIT)
     detected_count, detected_marks = detect_questions_and_marks(extracted_text)
 
     if detected_count < 1:
@@ -618,19 +666,24 @@ def infer_question_setup_from_rubric(rubric, fallback_question_count, fallback_d
     return question_count, default_marks, marks_text
 
 
-def detect_question_metadata_with_gemini(assignment_pdf, logger):
+def detect_question_metadata_with_gemini(assignment_pdf, logger, model_name=None):
+    active_model = normalize_model_name(model_name or DEFAULT_SOLUTION_MODEL)
     tmp_dir = Path.cwd()
     temp_folder = Path(tempfile.mkdtemp(prefix="assignment_meta_pdf_", dir=tmp_dir))
     pil_images = []
+    extracted_text = ""
     try:
-        image_paths = convert_pdf_to_images(
-            assignment_pdf,
-            temp_folder,
-            DEFAULT_PAGE_LIMIT,
-            DEFAULT_DPI,
-            logger,
-        )
-        pil_images = open_pil_images(image_paths)
+        if is_text_only_model(active_model):
+            extracted_text = extract_pdf_text(assignment_pdf, METADATA_PAGE_LIMIT, logger)
+        else:
+            image_paths = convert_pdf_to_images(
+                assignment_pdf,
+                temp_folder,
+                METADATA_PAGE_LIMIT,
+                METADATA_DPI,
+                logger,
+            )
+            pil_images = open_pil_images(image_paths)
         prompt = """
 Extract the complete list of main questions and each question's maximum marks from this assignment PDF.
 
@@ -655,9 +708,10 @@ Rules:
             prompt,
             pil_images,
             logger,
-            DEFAULT_TIMEOUT_SECONDS,
-            DEFAULT_RETRY_COUNT,
-            DEFAULT_SOLUTION_MODEL,
+            METADATA_TIMEOUT_SECONDS,
+            METADATA_RETRY_COUNT,
+            active_model,
+            extracted_text=extracted_text,
         )
 
         questions_map = parse_question_marks_map(response.get("questions", {}), fallback_default_marks=3)
@@ -769,9 +823,16 @@ def extract_json_object(text):
         return json.loads(match.group(0))
 
 
-def call_gemini_json(prompt, pil_images, logger, timeout_seconds, retry_count, model_name):
+def call_gemini_json(prompt, pil_images, logger, timeout_seconds, retry_count, model_name, extracted_text=""):
     generation_config = genai.GenerationConfig(response_mime_type="application/json")
-    contents = [prompt] + pil_images
+    contents = [prompt]
+    if extracted_text:
+        contents.append(
+            "Document text extracted from the PDF is provided below. "
+            "This may be imperfect for scanned/handwritten pages:\n\n"
+            f"{extracted_text}"
+        )
+    contents.extend(pil_images)
     last_error = None
     model = genai.GenerativeModel(model_name)
 
@@ -1035,15 +1096,24 @@ def generate_assignment_materials(config, assignment_pdf, session_dir, logger):
     tmp_dir = Path.cwd()
     temp_folder = Path(tempfile.mkdtemp(prefix="assignment_pdf_", dir=tmp_dir))
     pil_images = []
+    extracted_text = ""
     try:
-        image_paths = convert_pdf_to_images(
-            assignment_pdf,
-            temp_folder,
-            config["page_limit"],
-            config["dpi"],
-            logger,
-        )
-        pil_images = open_pil_images(image_paths)
+        if is_text_only_model(config["solution_model"]):
+            extracted_text = extract_pdf_text(
+                assignment_pdf,
+                config["page_limit"],
+                logger,
+                require_text=True,
+            )
+        else:
+            image_paths = convert_pdf_to_images(
+                assignment_pdf,
+                temp_folder,
+                config["page_limit"],
+                config["dpi"],
+                logger,
+            )
+            pil_images = open_pil_images(image_paths)
         prompt = build_assignment_prompt(config)
         result = call_gemini_json(
             prompt,
@@ -1052,6 +1122,7 @@ def generate_assignment_materials(config, assignment_pdf, session_dir, logger):
             config["timeout_seconds"],
             config["retry_count"],
             config["solution_model"],
+            extracted_text=extracted_text,
         )
 
         solution_manual = result.get("solution_manual", {})
@@ -1123,6 +1194,7 @@ def evaluate_single_submission(pdf_path, submissions_root, output_root, config, 
     tmp_dir = Path.cwd()
     temp_folder = Path(tempfile.mkdtemp(prefix="submission_pdf_", dir=tmp_dir))
     pil_images = []
+    extracted_text = ""
     started_at = datetime.now().isoformat(timespec="seconds")
 
     result_data = {
@@ -1145,14 +1217,22 @@ def evaluate_single_submission(pdf_path, submissions_root, output_root, config, 
     }
 
     try:
-        image_paths = convert_pdf_to_images(
-            pdf_path,
-            temp_folder,
-            config["page_limit"],
-            config["dpi"],
-            logger,
-        )
-        pil_images = open_pil_images(image_paths)
+        if is_text_only_model(config["evaluation_model"]):
+            extracted_text = extract_pdf_text(
+                pdf_path,
+                config["page_limit"],
+                logger,
+                require_text=True,
+            )
+        else:
+            image_paths = convert_pdf_to_images(
+                pdf_path,
+                temp_folder,
+                config["page_limit"],
+                config["dpi"],
+                logger,
+            )
+            pil_images = open_pil_images(image_paths)
         prompt = build_grading_prompt(config, assignment_materials, pdf_path.name)
         response_data = call_gemini_json(
             prompt,
@@ -1161,6 +1241,7 @@ def evaluate_single_submission(pdf_path, submissions_root, output_root, config, 
             config["timeout_seconds"],
             config["retry_count"],
             config["evaluation_model"],
+            extracted_text=extracted_text,
         )
 
         student_info = response_data.get("student_info", {}) if isinstance(response_data, dict) else {}
@@ -1333,7 +1414,7 @@ def collect_assignment_pdf_input():
         if not assignment_pdf.is_file():
             messagebox.showerror("Invalid input", "Select a valid assignment PDF file.", parent=root)
             return
-        selected_model = solution_model_var.get().strip() or DEFAULT_SOLUTION_MODEL
+        selected_model = normalize_model_name(solution_model_var.get().strip() or DEFAULT_SOLUTION_MODEL)
         result["assignment_pdf"] = assignment_pdf.resolve()
         result["solution_model"] = selected_model
         result["submitted"] = True
@@ -1360,7 +1441,7 @@ def collect_assignment_pdf_input():
         content,
         textvariable=solution_model_var,
         values=AVAILABLE_MODELS,
-        state="normal",
+        state="readonly",
         width=30,
     ).grid(row=2, column=1, columnspan=2, sticky="ew", pady=4)
 
@@ -1656,8 +1737,8 @@ def collect_evaluation_inputs(assignment_pdf, defaults):
             "marks_text": marks_text_var.get().strip(),
             "strictness": strictness_var.get(),
             "feedback_style": feedback_style_var.get(),
-            "solution_model": solution_model_var.get().strip() or DEFAULT_SOLUTION_MODEL,
-            "evaluation_model": evaluation_model_var.get().strip() or DEFAULT_EVALUATION_MODEL,
+            "solution_model": normalize_model_name(solution_model_var.get().strip() or DEFAULT_SOLUTION_MODEL),
+            "evaluation_model": normalize_model_name(evaluation_model_var.get().strip() or DEFAULT_EVALUATION_MODEL),
             "expect_handwritten": expect_handwritten_var.get(),
         }
         result["submitted"] = True
@@ -1714,13 +1795,13 @@ def collect_evaluation_inputs(assignment_pdf, defaults):
     ttk.Label(content, text="Solution model").grid(row=10, column=0, sticky="w", padx=(0, 8), pady=4)
     ttk.Combobox(
         content, textvariable=solution_model_var,
-        values=AVAILABLE_MODELS, state="normal", width=30,
+        values=AVAILABLE_MODELS, state="readonly", width=30,
     ).grid(row=10, column=1, columnspan=2, sticky="ew", pady=4)
 
     ttk.Label(content, text="Evaluation model").grid(row=11, column=0, sticky="w", padx=(0, 8), pady=4)
     ttk.Combobox(
         content, textvariable=evaluation_model_var,
-        values=AVAILABLE_MODELS, state="normal", width=30,
+        values=AVAILABLE_MODELS, state="readonly", width=30,
     ).grid(row=11, column=1, columnspan=2, sticky="ew", pady=4)
 
     ttk.Checkbutton(
@@ -1762,7 +1843,7 @@ def collect_user_config():
     gemini_meta = run_task_with_progress(
         "Detecting Questions",
         "Extracting question count and marks from assignment PDF...",
-        lambda: detect_question_metadata_with_gemini(assignment_pdf, logger),
+        lambda: detect_question_metadata_with_gemini(assignment_pdf, logger, selected_solution_model),
     )
     gemini_marks_map = gemini_meta.get("marks_map", {}) if gemini_meta.get("success") else {}
     if gemini_marks_map:
