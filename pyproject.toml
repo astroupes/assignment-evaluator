@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "assignment-evaluator"
+version = "1.0.0"
+description = "AI-powered assignment grading tool — auto-generates rubrics and grades student PDF submissions using Google Gemini."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Nitesh Kumar" },
+]
+keywords = ["grading", "assignment", "gemini", "AI", "education", "PDF", "rubric"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Education",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Education",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "pymupdf>=1.24.0",
+    "Pillow>=10.0.0",
+    "pandas>=2.0.0",
+    "openpyxl>=3.1.0",
+    "google-generativeai>=0.8.0",
+    "pdf2image>=1.16.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "build>=1.0",
+    "twine>=5.0",
+]
+
+[project.scripts]
+assignment-evaluator = "assignment_evaluator.app:main"
+
+[project.urls]
+"Source Code" = "https://github.com/your-org/assignment-evaluator"
+"Bug Tracker"  = "https://github.com/your-org/assignment-evaluator/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["assignment_evaluator*"]
